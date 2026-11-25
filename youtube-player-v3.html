@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube Player</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #000;
+      width: 100%;
+      height: 100%;
+      min-height: 270px;
+      overflow: hidden;
+    }
+
+    #player, iframe {
+      width: 100%;
+      height: 100%;
+      min-height: 270px;
+      border: 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="player"></div>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const videoId = params.get("videoId") || "M7lc1UVf-VE";
+    const shouldAutoplay = params.get("autoplay") === "1";
+    const isPreload = params.get("preload") === "1";
+    const shouldStartMuted = params.get("mute") === "1";
+    const pageOrigin = window.location.origin && window.location.origin !== "null"
+      ? window.location.origin
+      : "https://lp1014-js.github.io";
+
+    const STATE_NAMES = {
+      "-1": "UNSTARTED",
+      0: "ENDED",
+      1: "PLAYING",
+      2: "PAUSED",
+      3: "BUFFERING",
+      5: "CUED"
+    };
+
+    function sendToNative(level, message, data) {
+      const payload = {
+        source: "youtube-player.html",
+        level,
+        message,
+        data: data || null,
+        videoId
+      };
+
+      try {
+        window.webkit?.messageHandlers?.youtubePlayback?.postMessage(payload);
+        window.webkit?.messageHandlers?.youtubePlaybackLab?.postMessage(payload);
+      } catch (error) {
+        // Safe when opened outside WKWebView.
+      }
+
+      console[level === "error" ? "error" : "log"](message, data || "");
+    }
+
+    window.addEventListener("error", (event) => {
+      sendToNative("error", "window.onerror", {
+        message: event.message,
+        source: event.filename,
+        line: event.lineno,
+        column: event.colno
+      });
+    });
+
+    window.addEventListener("unhandledrejection", (event) => {
+      sendToNative("error", "unhandledrejection", {
+        reason: String(event.reason)
+      });
+    });
+
+    let player;
+    let playerReady = false;
+    let pendingCommand = null;
+    let pendingAutoplay = shouldAutoplay && !isPreload;
+    let progressTimer = null;
+
+    function clearProgressTimer() {
+      if (progressTimer) {
+        clearInterval(progressTimer);
+        progressTimer = null;
+      }
+    }
+
+    function startProgressTimer() {
+      clearProgressTimer();
+      progressTimer = setInterval(() => {
+        publishPlaybackState("progress");
+      }, 250);
+    }
+
+    function publishPlaybackState(reason) {
+      if (!player || typeof player.getCurrentTime !== "function") {
+        return;
+      }
+
+      const currentTime = Number(player.getCurrentTime()) || 0;
+      const duration = Number(player.getDuration()) || 0;
+      const playerState = typeof player.getPlayerState === "function" ? player.getPlayerState() : -1;
+      const stateName = STATE_NAMES[String(playerState)] || "UNKNOWN";
+
+      sendToNative("playback", reason || "state", {
+        currentTime,
+        duration,
+        playerState,
+        stateName,
+        isPlaying: playerState === 1,
+        isEnded: playerState === 0
+      });
+    }
+
+    function verifyAutoplay(source) {
+      if (!player || typeof player.getPlayerState !== "function") {
+        sendToNative("playback", "autoplayResult", {
+          success: false,
+          playerState: -1,
+          stateName: "UNSTARTED",
+          source
+        });
+        return;
+      }
+
+      const playerState = player.getPlayerState();
+      const stateName = STATE_NAMES[String(playerState)] || "UNKNOWN";
+      const success = playerState === 1;
+      sendToNative("playback", "autoplayResult", {
+        success,
+        playerState,
+        stateName,
+        source
+      });
+      publishPlaybackState("autoplayVerify");
+    }
+
+    function attemptAutoplay(source) {
+      if (!player || typeof player.playVideo !== "function") {
+        sendToNative("lifecycle", "autoplayDeferred", { source, reason: "player-not-ready" });
+        pendingAutoplay = true;
+        return { status: "deferred", source };
+      }
+
+      try {
+        player.playVideo();
+        sendToNative("lifecycle", "playVideoCalled", { source });
+      } catch (error) {
+        sendToNative("error", "playVideo threw", { message: error.message, source });
+        sendToNative("playback", "autoplayResult", {
+          success: false,
+          playerState: -1,
+          stateName: "ERROR",
+          source,
+          error: error.message
+        });
+        return { status: "failed", source };
+      }
+
+      window.setTimeout(() => verifyAutoplay(source), 800);
+      return { status: "attempted", source };
+    }
+
+    function flushPendingAutoplay(source) {
+      if (!pendingAutoplay) {
+        return { status: "idle", source };
+      }
+
+      pendingAutoplay = false;
+      return attemptAutoplay(source || "pendingAutoplay");
+    }
+
+    window.worshipFlowYouTube = {
+      requestAutoplay() {
+        pendingAutoplay = true;
+        if (!playerReady) {
+          sendToNative("lifecycle", "autoplayDeferred", { source: "requestAutoplay", reason: "player-not-ready" });
+          return { status: "deferred", source: "requestAutoplay" };
+        }
+        return flushPendingAutoplay("requestAutoplay");
+      },
+      play() {
+        if (!player || typeof player.playVideo !== "function") {
+          pendingCommand = "play";
+          return false;
+        }
+
+        pendingCommand = null;
+        player.playVideo();
+        sendToNative("lifecycle", "playVideoCalled", { source: "manualPlay" });
+        publishPlaybackState("manualPlay");
+        return true;
+      },
+      pause() {
+        if (!player || typeof player.pauseVideo !== "function") {
+          pendingCommand = "pause";
+          return false;
+        }
+
+        pendingCommand = null;
+        player.pauseVideo();
+        publishPlaybackState("pause");
+        return true;
+      },
+      mute() {
+        if (!player || typeof player.mute !== "function") {
+          return false;
+        }
+        player.mute();
+        return true;
+      },
+      unmute() {
+        if (!player || typeof player.unMute !== "function") {
+          return false;
+        }
+        player.unMute();
+        return true;
+      },
+      seek(seconds) {
+        if (!player || typeof player.seekTo !== "function") {
+          return false;
+        }
+
+        const bounded = Math.max(0, Number(seconds) || 0);
+        player.seekTo(bounded, true);
+        publishPlaybackState("seek");
+        return true;
+      },
+      getPlaybackState() {
+        publishPlaybackState("query");
+        return true;
+      }
+    };
+
+    function reportPlayerAPIUnavailable(reason) {
+      sendToNative("error", "onError", {
+        code: "player-api-unavailable",
+        errorCode: -1,
+        reason: reason || "script"
+      });
+    }
+
+    function onYouTubeIframeAPIReady() {
+      if (player) {
+        sendToNative("log", "onYouTubeIframeAPIReadyIgnored");
+        return;
+      }
+      sendToNative("log", "onYouTubeIframeAPIReady");
+
+      try {
+      player = new YT.Player("player", {
+        width: "100%",
+        height: "100%",
+        videoId,
+        playerVars: {
+          autoplay: shouldAutoplay && !isPreload ? 1 : 0,
+          playsinline: 1,
+          rel: 0,
+          enablejsapi: 1,
+          origin: pageOrigin,
+          modestbranding: 1,
+          controls: 1,
+          fs: 0,
+          mute: shouldStartMuted ? 1 : 0
+        },
+        events: {
+          onReady: onPlayerReady,
+          onStateChange: onPlayerStateChange,
+          onError: onPlayerError
+        }
+      });
+      } catch (error) {
+        player = null;
+        reportPlayerAPIUnavailable("constructor");
+      }
+    }
+
+    function onPlayerReady(event) {
+      playerReady = true;
+      sendToNative("lifecycle", "playerReady", { videoId, preload: isPreload });
+
+      const iframe = event.target.getIframe();
+      iframe.setAttribute("allow", "autoplay; encrypted-media; picture-in-picture");
+      iframe.setAttribute("allowfullscreen", "");
+      iframe.style.width = "100%";
+      iframe.style.height = "100%";
+      iframe.style.minHeight = "270px";
+
+      publishPlaybackState("ready");
+
+      const queued = pendingCommand;
+      pendingCommand = null;
+      if (queued === "pause") {
+        pendingAutoplay = false;
+        event.target.pauseVideo();
+        publishPlaybackState("pause");
+      } else if (queued === "play") {
+        event.target.playVideo();
+        sendToNative("lifecycle", "playVideoCalled", { source: "queuedPlay" });
+        publishPlaybackState("manualPlay");
+      } else if (!isPreload) {
+        flushPendingAutoplay("onReady");
+      }
+    }
+
+    function onPlayerStateChange(event) {
+      const stateName = STATE_NAMES[String(event.data)] || "UNKNOWN";
+      sendToNative("playback", "stateChange", {
+        playerState: event.data,
+        stateName
+      });
+      publishPlaybackState("onStateChange");
+
+      if (event.data === 1) {
+        startProgressTimer();
+      } else {
+        clearProgressTimer();
+      }
+    }
+
+    function onPlayerError(event) {
+      sendToNative("error", "onError", {
+        code: event.data,
+        errorCode: event.data,
+        origin: pageOrigin
+      });
+    }
+    let apiScriptRequested = false;
+    function loadYouTubeIframeAPI() {
+      if (window.YT && window.YT.Player) {
+        onYouTubeIframeAPIReady();
+        return;
+      }
+      if (apiScriptRequested) {
+        return;
+      }
+      apiScriptRequested = true;
+      const apiScript = document.createElement("script");
+      apiScript.src = "https://www.youtube.com/iframe_api";
+      apiScript.onerror = function() {
+        reportPlayerAPIUnavailable("script");
+      };
+      document.body.appendChild(apiScript);
+    }
+
+    loadYouTubeIframeAPI();
+  </script>
+</body>
+</html>
